@@ -169,31 +169,4 @@ if __name__ == '__main__':
 
 
 
-'''
-    # initialize volume extractor
-    volume_extractor = Volume_Extractor(args.data.block_size, args.data.volume_smooth_size)
-  
-    # initialize mel extractor
-    mel_extractor = None
-    use_pitch_aug = False
-    mel_extractor = Vocoder(args.vocoder.type, args.vocoder.ckpt, device = device)
-    if mel_extractor.vocoder_sample_rate != sample_rate or mel_extractor.vocoder_hop_size != hop_size:
-        mel_extractor = None
-        print('Unmatch vocoder parameters, mel extraction is ignored!')
-    elif args.model.use_pitch_aug:
-        use_pitch_aug = True
-    
-    # initialize units encoder
-    if args.data.encoder == 'cnhubertsoftfish':
-        cnhubertsoft_gate = args.data.cnhubertsoft_gate
-    else:
-        cnhubertsoft_gate = 10
-    units_encoder = Units_Encoder(
-                        args.data.encoder, 
-                        args.data.encoder_ckpt, 
-                        args.data.encoder_sample_rate, 
-                        args.data.encoder_hop_size,
-                        cnhubertsoft_gate=cnhubertsoft_gate,
-                        device = device)    
-'''
   
