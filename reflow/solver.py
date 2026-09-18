@@ -87,6 +87,8 @@ def test(args, model, vocoder, loader_test, saver):
                     data['f0'], 
                     data['volume'], 
                     data['spk_id'],
+                    spk_vec=data.get('spk_vec'),
+                    spk_tokens=data.get('spk_tokens'),
                     vocoder=vocoder,
                     infer=True,
                     return_wav=False,
@@ -109,6 +111,8 @@ def test(args, model, vocoder, loader_test, saver):
                 data['f0'], 
                 data['volume'], 
                 data['spk_id'],
+                spk_vec=data.get('spk_vec'),
+                spk_tokens=data.get('spk_tokens'),
                 vocoder=vocoder,
                 gt_spec=data['mel'],
                 infer=False,
@@ -205,10 +209,14 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder, loade
             # forward
             if dtype == torch.float32:
                 ddsp_loss, reflow_loss = model(data['units'].float(), data['f0'], data['volume'], data['spk_id'], 
+                                spk_vec=data.get('spk_vec'),
+                                spk_tokens=data.get('spk_tokens'),
                                 aug_shift=data['aug_shift'], vocoder=vocoder, gt_spec=data['mel'].float(), infer=False, t_start=args.model.t_start)
             else:
                 with autocast(device_type=args.device, dtype=dtype):
                     ddsp_loss, reflow_loss=model(data['units'], data['f0'], data['volume'], data['spk_id'], 
+                                    spk_vec=data.get('spk_vec'),
+                                    spk_tokens=data.get('spk_tokens'),
                                     aug_shift=data['aug_shift'], vocoder=vocoder, gt_spec=data['mel'].float(), infer=False, t_start=args.model.t_start)
             
             # handle nan loss

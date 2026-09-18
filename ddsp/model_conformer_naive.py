@@ -5,7 +5,15 @@ import torch.nn.functional as F
 # From https://github.com/CNChTu/Diffusion-SVC/ by CNChTu
 # License: MIT
 
-      
+
+def create_zero_linear(in_features, out_features):
+    """A linear layer whose output is exactly zero at initialization (identity FiLM)."""
+    layer = nn.Linear(in_features, out_features)
+    nn.init.zeros_(layer.weight)
+    nn.init.zeros_(layer.bias)
+    return layer
+
+
 class ConformerNaiveEncoder(nn.Module):
     """
     Conformer Naive Encoder
@@ -18,6 +26,7 @@ class ConformerNaiveEncoder(nn.Module):
         conv_only (bool): Whether to use only conv module without attention, default False
         conv_dropout (float): Dropout rate of conv module, default 0.
         atten_dropout (float): Dropout rate of attention module, default 0.
+        film_cond_dim (int): If > 0, apply per-layer FiLM conditioned on a vector of this dim, default 0.
     """
 
     def __init__(self,
@@ -27,7 +36,8 @@ class ConformerNaiveEncoder(nn.Module):
                  use_norm: bool = False,
                  conv_only: bool = False,
                  conv_dropout: float = 0.,
-                 atten_dropout: float = 0.
+                 atten_dropout: float = 0.,
+                 film_cond_dim: int = 0
                  ):
         super().__init__()
         self.num_layers = num_layers
@@ -44,17 +54,28 @@ class ConformerNaiveEncoder(nn.Module):
             ]
         )
 
-    def forward(self, x, mask=None) -> torch.Tensor:
+        if film_cond_dim > 0:
+            self.films = nn.ModuleList(
+                [create_zero_linear(film_cond_dim, dim_model * 2) for _ in range(num_layers)]
+            )
+        else:
+            self.films = None
+
+    def forward(self, x, mask=None, film_cond=None) -> torch.Tensor:
         """
         Args:
             x (torch.Tensor): Input tensor (#batch, length, dim_model)
             mask (torch.Tensor): Mask tensor, default None
+            film_cond (torch.Tensor): Speaker condition (#batch, film_cond_dim), default None
         return:
             torch.Tensor: Output tensor (#batch, length, dim_model)
         """
 
         for (i, layer) in enumerate(self.encoder_layers):
             x = layer(x, mask)
+            if self.films is not None and film_cond is not None:
+                scale, shift = self.films[i](film_cond).chunk(2, dim=-1)
+                x = x * (1 + scale[:, None, :]) + shift[:, None, :]
         return x  # (#batch, length, dim_model)
 
 

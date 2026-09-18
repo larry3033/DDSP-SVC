@@ -17,10 +17,10 @@ class RectifiedFlow(nn.Module):
         self.spec_min = spec_min
         self.spec_max = spec_max
     
-    def reflow_loss(self, x_1, t, cond, loss_type='l2_lognorm'):
+    def reflow_loss(self, x_1, t, cond, loss_type='l2_lognorm', spk_cond=None):
         x_0 = torch.randn_like(x_1)
         x_t = x_0 + t[:, None, None, None] * (x_1 - x_0)
-        v_pred = self.velocity_fn(x_t, 1000 * t, cond)
+        v_pred = self.velocity_fn(x_t, 1000 * t, cond, spk_cond=spk_cond)
         
         if loss_type == 'l1':
             loss = (x_1 - x_0 - v_pred).abs().mean()
@@ -34,16 +34,16 @@ class RectifiedFlow(nn.Module):
 
         return loss
     
-    def sample_euler(self, x, t, dt, cond):
-        x += self.velocity_fn(x, 1000 * t, cond) * dt
+    def sample_euler(self, x, t, dt, cond, spk_cond=None):
+        x += self.velocity_fn(x, 1000 * t, cond, spk_cond=spk_cond) * dt
         t += dt
         return x, t
         
-    def sample_rk4(self, x, t, dt ,cond):
-        k_1 = self.velocity_fn(x, 1000 * t, cond)
-        k_2 = self.velocity_fn(x + 0.5 * k_1 * dt, 1000 * (t + 0.5 * dt), cond)
-        k_3 = self.velocity_fn(x + 0.5 * k_2 * dt, 1000 * (t + 0.5 * dt), cond)
-        k_4 = self.velocity_fn(x + k_3 * dt, 1000 * (t + dt), cond)
+    def sample_rk4(self, x, t, dt ,cond, spk_cond=None):
+        k_1 = self.velocity_fn(x, 1000 * t, cond, spk_cond=spk_cond)
+        k_2 = self.velocity_fn(x + 0.5 * k_1 * dt, 1000 * (t + 0.5 * dt), cond, spk_cond=spk_cond)
+        k_3 = self.velocity_fn(x + 0.5 * k_2 * dt, 1000 * (t + 0.5 * dt), cond, spk_cond=spk_cond)
+        k_4 = self.velocity_fn(x + k_3 * dt, 1000 * (t + dt), cond, spk_cond=spk_cond)
         x += (k_1 + 2 * k_2 + 2 * k_3 + k_4) * dt / 6
         t += dt
         return x, t
@@ -55,7 +55,8 @@ class RectifiedFlow(nn.Module):
                 infer_step=10,
                 method='euler',
                 t_start=0.0,
-                use_tqdm=True):
+                use_tqdm=True,
+                spk_cond=None):
         cond = condition.transpose(1, 2) # [B, H, T]
         b, device = condition.shape[0], condition.device
         if t_start < 0.0:
@@ -65,7 +66,7 @@ class RectifiedFlow(nn.Module):
             x_1 = x_1.transpose(1, 2)[:, None, :, :]  # [B, 1, M, T]
             t = t_start + (1.0 - t_start) * torch.rand(b, device=device)
             t = torch.clip(t, 1e-7, 1-1e-7)
-            return self.reflow_loss(x_1, t, cond=cond)
+            return self.reflow_loss(x_1, t, cond=cond, spk_cond=spk_cond)
         else:
             shape = (cond.shape[0], 1, self.out_dims, cond.shape[2]) # [B, 1, M, T]
             
@@ -84,18 +85,18 @@ class RectifiedFlow(nn.Module):
             if method == 'euler':
                 if use_tqdm:
                     for i in tqdm(range(infer_step), desc='sample time step', total=infer_step):
-                        x, t = self.sample_euler(x, t, dt, cond)
+                        x, t = self.sample_euler(x, t, dt, cond, spk_cond=spk_cond)
                 else:
                     for i in range(infer_step):
-                        x, t = self.sample_euler(x, t, dt, cond)
+                        x, t = self.sample_euler(x, t, dt, cond, spk_cond=spk_cond)
             
             elif method == 'rk4':
                 if use_tqdm:
                     for i in tqdm(range(infer_step), desc='sample time step', total=infer_step):
-                        x, t = self.sample_rk4(x, t, dt, cond)
+                        x, t = self.sample_rk4(x, t, dt, cond, spk_cond=spk_cond)
                 else:
                     for i in range(infer_step):
-                        x, t = self.sample_rk4(x, t, dt, cond)
+                        x, t = self.sample_rk4(x, t, dt, cond, spk_cond=spk_cond)
             
             else:
                 raise NotImplementedError(method)

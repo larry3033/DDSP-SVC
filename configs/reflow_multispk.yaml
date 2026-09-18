@@ -1,0 +1,68 @@
+data:
+  f0_extractor: 'rmvpe'
+  f0_min: 65
+  f0_max: 800
+  sampling_rate: 44100
+  volume_smooth_size: 1024
+  block_size: 512
+  duration: 2
+  encoder: 'contentvec768l12tta2x'
+  encoder_sample_rate: 16000
+  encoder_hop_size: 160
+  encoder_out_channels: 768
+  encoder_ckpt: pretrain/contentvec/pytorch_model.bin
+  train_path: /root/autodl-tmp/ddsp-data/train
+  valid_path: /root/autodl-tmp/ddsp-data/val
+  extensions:
+    - wav
+model:
+  type: 'RectifiedFlow'
+  win_length: 2048
+  n_aux_layers: 8
+  n_aux_chans: 768
+  n_layers: 6
+  n_chans: 1024
+  t_start: 0.0
+  use_norm: true
+  use_attention: false
+  use_pitch_aug: true
+  n_spk: 1
+  use_spk: true
+  spk_dim: 512
+  use_spk_film: true
+  use_spk_reflow: true
+  use_spk_tokens: true
+  spk_token_dim: 768
+  spk_n_tokens: 16
+  spk_backend: 'wavlm-sv'
+  spk_model: 'microsoft/wavlm-base-plus-sv'
+device: cuda
+vocoder:
+  type: 'nsf-hifigan'
+  ckpt: 'pretrain/nsf_hifigan/model'
+infer:
+  infer_step: 50
+  method: 'euler'
+env:
+  expdir: /root/autodl-tmp/ddsp-multispk
+  gpu_id: 0
+train:
+  num_workers: 12
+  amp_dtype: bf16
+  batch_size: 96
+  cache_all_data: false
+  cache_device: 'cpu'
+  cache_fp16: true
+  epochs: 100000
+  interval_log: 1
+  interval_val: 2000
+  interval_force_save: 10000
+  lr: 0.0005
+  decay_step: 30000
+  gamma: 0.9
+  weight_decay: 0.1
+  lambda_ddsp: 1
+  save_opt: false
+  spk_cross_prob: 0.5
+  spk_noise: 0.02
+  spk_drop_prob: 0.1

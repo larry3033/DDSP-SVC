@@ -4,8 +4,6 @@ import librosa
 import argparse
 import numpy as np
 import soundfile as sf
-import pyworld as pw
-import parselmouth
 import hashlib
 from ast import literal_eval
 from slicer import Slicer
@@ -98,12 +96,20 @@ def parse_args(args=None, namespace=None):
         help="vocal register changed (number of semitones) , only for pc-type vocoder| default: 0",
     )
     parser.add_argument(
+        "-r",
+        "--reference",
+        type=str,
+        required=False,
+        default='',
+        help="path(s) to reference audio for zero-shot timbre, comma separated | default: empty (zero embedding)",
+    )
+    parser.add_argument(
         "-pe",
         "--pitch_extractor",
         type=str,
         required=False,
         default='rmvpe',
-        help="pitch extrator type: parselmouth, dio, harvest, crepe, fcpe, rmvpe (default)",
+        help="pitch extrator type: rmvpe (default)",
     )
     parser.add_argument(
         "-fmin",
@@ -260,17 +266,42 @@ if __name__ == '__main__':
     volume = torch.from_numpy(volume).float().to(device).unsqueeze(-1).unsqueeze(0)
     
     # load units encoder
-    if args.data.encoder == 'cnhubertsoftfish':
-        cnhubertsoft_gate = args.data.cnhubertsoft_gate
-    else:
-        cnhubertsoft_gate = 10
     units_encoder = Units_Encoder(
                         args.data.encoder, 
                         args.data.encoder_ckpt, 
                         args.data.encoder_sample_rate, 
                         args.data.encoder_hop_size,
-                        cnhubertsoft_gate=cnhubertsoft_gate,
                         device = device)
+
+    # zero-shot speaker embedding / tokens from reference audio
+    spk_vec = None
+    spk_tokens = None
+    spk_dim = int(args.model.get('spk_dim', 0)) if args.model.get('use_spk', False) else 0
+    if spk_dim > 0:
+        from encoder.spk_encoder import SpkEncoder
+        spk_encoder = SpkEncoder(
+                        args.model.get('spk_backend', 'wavlm-sv'),
+                        args.model.get('spk_model', None),
+                        device = device)
+        assert spk_encoder.dim == spk_dim, \
+            f' [x] config spk_dim={spk_dim} but encoder outputs {spk_encoder.dim}'
+        refs = [r.strip() for r in cmd.reference.split(',') if r.strip() != '']
+        if len(refs) > 0:
+            print('Reference speaker(s): ' + ', '.join(refs))
+        else:
+            print(' [warn] no reference audio given (use -r), using a zero speaker embedding')
+        if len(refs) > 0:
+            z = spk_encoder.encode_files(refs)
+        else:
+            z = np.zeros(spk_encoder.dim, dtype=np.float32)
+        spk_vec = torch.from_numpy(z.astype(np.float32)).unsqueeze(0).to(device)
+        if args.model.get('use_spk_tokens', False):
+            n_tokens = int(args.model.get('spk_n_tokens', 16))
+            if len(refs) > 0:
+                toks = spk_encoder.encode_tokens_files(refs, n_tokens=n_tokens)
+            else:
+                toks = np.zeros((n_tokens, spk_encoder.hidden_dim), dtype=np.float32)
+            spk_tokens = torch.from_numpy(toks.astype(np.float32)).unsqueeze(0).to(device)
                             
     # speaker id or mix-speaker dictionary
     spk_mix_dict = literal_eval(cmd.spk_mix_dict)
@@ -330,6 +361,8 @@ if __name__ == '__main__':
                     spk_id = spk_id, 
                     spk_mix_dict = spk_mix_dict,
                     aug_shift = formant_shift_key,
+                    spk_vec = spk_vec,
+                    spk_tokens = spk_tokens,
                     vocoder=vocoder,
                     infer_step=infer_step, 
                     method=method,

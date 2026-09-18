@@ -1,8 +1,36 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 from .model_conformer_naive import ConformerNaiveEncoder
+
+
+class CrossAttention(nn.Module):
+    """Multi-head cross-attention built on scaled_dot_product_attention (fast, low-memory)."""
+
+    def __init__(self, dim, num_heads=8, zero_init_out=True):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        if zero_init_out:
+            nn.init.zeros_(self.out_proj.weight)
+            nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x, ctx):
+        B, T, C = x.shape
+        K = ctx.shape[1]
+        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(ctx).view(B, K, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(ctx).view(B, K, self.num_heads, self.head_dim).transpose(1, 2)
+        a = F.scaled_dot_product_attention(q, k, v)
+        a = a.transpose(1, 2).reshape(B, T, C)
+        return self.out_proj(a)
 
 
 def split_to_dict(tensor, tensor_splits):
@@ -29,7 +57,10 @@ class Unit2Control(nn.Module):
             dim_model=256,
             use_norm=False,
             use_attention=False,
-            use_pitch_aug=False):
+            use_pitch_aug=False,
+            spk_dim=0,
+            use_spk_film=False,
+            spk_token_dim=0):
         super().__init__()
         self.output_splits = output_splits
         self.f0_embed = nn.Linear(1, dim_model)
@@ -42,7 +73,29 @@ class Unit2Control(nn.Module):
             self.aug_shift_embed = nn.Linear(1, dim_model, bias=False)
         else:
             self.aug_shift_embed = None
-            
+
+        # continuous speaker conditioning (zero-shot)
+        self.spk_dim = spk_dim
+        if spk_dim is not None and spk_dim > 0:
+            self.spk_proj = nn.Linear(spk_dim, dim_model)
+            nn.init.zeros_(self.spk_proj.weight)
+            nn.init.zeros_(self.spk_proj.bias)
+            self.spk_norm = nn.LayerNorm(dim_model)
+        else:
+            self.spk_proj = None
+            self.spk_norm = None
+
+        # speaker token cross-attention (zero-shot, in-context)
+        self.spk_token_dim = spk_token_dim
+        if spk_token_dim is not None and spk_token_dim > 0:
+            self.spk_token_proj = nn.Linear(spk_token_dim, dim_model)
+            self.spk_cross_norm = nn.LayerNorm(dim_model)
+            self.spk_cross = CrossAttention(dim_model, 8, zero_init_out=True)
+        else:
+            self.spk_token_proj = None
+            self.spk_cross_norm = None
+            self.spk_cross = None
+
         self.stack = nn.Sequential(
                 weight_norm(nn.Conv1d(input_channel, 512, 3, 1, 1)),
                 nn.PReLU(num_parameters=512),
@@ -58,12 +111,13 @@ class Unit2Control(nn.Module):
                 use_norm=use_norm,
                 conv_only=not use_attention,
                 conv_dropout=0,
-                atten_dropout=0.1)
+                atten_dropout=0.1,
+                film_cond_dim=dim_model if (spk_dim and spk_dim > 0 and use_spk_film) else 0)
         self.norm = nn.LayerNorm(dim_model)
         self.n_out = sum([v for k, v in output_splits.items()])
         self.dense_out = weight_norm(nn.Linear(dim_model, self.n_out))
 
-    def forward(self, units, source, noise, volume, spk_id = None, spk_mix_dict = None, aug_shift = None):
+    def forward(self, units, source, noise, volume, spk_id = None, spk_mix_dict = None, aug_shift = None, spk_vec = None, spk_tokens = None):
         
         '''
         input: 
@@ -74,6 +128,19 @@ class Unit2Control(nn.Module):
         exciter = torch.cat((source, noise), dim=-1).transpose(1,2)
         x = self.stack(units.transpose(1, 2)) + self.stack2(exciter)
         x = x.transpose(1, 2) + self.volume_embed(volume)
+
+        # continuous speaker conditioning
+        spk_cond = None
+        if self.spk_proj is not None and spk_vec is not None:
+            spk_cond = self.spk_norm(self.spk_proj(spk_vec))
+            x = x + spk_cond.unsqueeze(1)
+
+        # speaker token cross-attention (pre-norm residual, no-op at init)
+        if self.spk_cross is not None and spk_tokens is not None:
+            tokens = self.spk_token_proj(spk_tokens)
+            attn = self.spk_cross(self.spk_cross_norm(x), tokens)
+            x = x + attn
+
         if self.n_spk is not None and self.n_spk > 1:
             if spk_mix_dict is not None:
                 for k, v in spk_mix_dict.items():
@@ -83,7 +150,7 @@ class Unit2Control(nn.Module):
                 x = x + self.spk_embed(spk_id - 1)
         if self.aug_shift_embed is not None and aug_shift is not None:
             x = x + self.aug_shift_embed(aug_shift / 5)
-        x = self.decoder(x)
+        x = self.decoder(x, film_cond=spk_cond)
         x = self.norm(x)
         e = self.dense_out(x)
         controls = split_to_dict(e, self.output_splits)

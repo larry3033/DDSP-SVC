@@ -54,6 +54,14 @@ class Transpose(nn.Module):
         return x.transpose(*self.dims)
 
 
+def create_zero_linear(in_features, out_features):
+    """A linear layer whose output is exactly zero at initialization (identity FiLM)."""
+    layer = nn.Linear(in_features, out_features)
+    nn.init.zeros_(layer.weight)
+    nn.init.zeros_(layer.bias)
+    return layer
+
+
 class LYNXNet2Block(nn.Module):
     def __init__(self, dim, expansion_factor, kernel_size=31, dropout=0.):
         super().__init__()
@@ -80,7 +88,7 @@ class LYNXNet2Block(nn.Module):
 
 
 class LYNXNet2(nn.Module):
-    def __init__(self, in_dims, dim_cond, n_layers=6, n_chans=512, n_dilates=1, dropout=0.):
+    def __init__(self, in_dims, dim_cond, n_layers=6, n_chans=512, n_dilates=1, dropout=0., spk_dim=0):
         """
         LYNXNet2(Linear Gated Depthwise Separable Convolution Network Version 2)
         """
@@ -107,12 +115,23 @@ class LYNXNet2(nn.Module):
         self.norm = nn.LayerNorm(n_chans)
         self.output_projection = nn.Linear(n_chans, in_dims)
         nn.init.zeros_(self.output_projection.weight)
-    
-    def forward(self, spec, diffusion_step, cond):
+
+        # continuous speaker conditioning (zero-shot)
+        if spk_dim is not None and spk_dim > 0:
+            self.spk_proj = nn.Linear(spk_dim, n_chans)
+            self.spk_films = nn.ModuleList(
+                [create_zero_linear(n_chans, n_chans * 2) for _ in range(n_layers)]
+            )
+        else:
+            self.spk_proj = None
+            self.spk_films = None
+
+    def forward(self, spec, diffusion_step, cond, spk_cond=None):
         """
         :param spec: [B, F, M, T]
         :param diffusion_step: [B, 1]
         :param cond: [B, H, T]
+        :param spk_cond: [B, spk_dim] continuous speaker embedding, optional
         :return:
         """
         
@@ -128,9 +147,16 @@ class LYNXNet2(nn.Module):
         x = self.input_projection(x.transpose(1, 2))
         x = x + self.conditioner_projection(cond.transpose(1, 2))
         x = x + self.diffusion_embedding(diffusion_step).unsqueeze(1)
-        
-        for layer in self.residual_layers:
+
+        spk = None
+        if self.spk_proj is not None and spk_cond is not None:
+            spk = self.spk_proj(spk_cond)
+
+        for i, layer in enumerate(self.residual_layers):
             x = layer(x)
+            if spk is not None:
+                scale, shift = self.spk_films[i](spk).chunk(2, dim=-1)
+                x = x * (1 + scale[:, None, :]) + shift[:, None, :]
 
         # post-norm
         x = self.norm(x)

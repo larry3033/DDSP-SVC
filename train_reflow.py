@@ -48,7 +48,11 @@ if __name__ == '__main__':
                     args.model.n_aux_layers,
                     args.model.n_aux_chans,
                     args.model.n_layers,
-                    args.model.n_chans) 
+                    args.model.n_chans,
+                    args.model.get('spk_dim', 0) if args.model.get('use_spk', False) else 0,
+                    args.model.get('use_spk_film', False),
+                    args.model.get('use_spk_reflow', False),
+                    args.model.get('spk_token_dim', 0) if (args.model.get('use_spk', False) and args.model.get('use_spk_tokens', False)) else 0) 
                     
     else:
         raise ValueError(f" [x] Unknown Model: {args.model.type}")

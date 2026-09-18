@@ -16,6 +16,31 @@ Disclaimer: Please make sure to only train DDSP-SVC models with **legally obtain
 
 Update log: I am too lazy to translate, please see the Chinese version readme.
 
+## 0.1 Zero-shot singing voice conversion (new in this branch)
+
+> This `zeroshot` branch adds **zero-shot timbre cloning** on top of upstream **DDSP-SVC 6.3**:
+> no per-speaker training is required — a single reference audio clip is enough to convert any
+> input voice to the reference speaker's timbre.
+
+- **Method**: WavLM-SV global speaker embedding (512-d) + per-layer FiLM in the DDSP
+  `ConformerNaiveEncoder` + per-block FiLM in the reflow `LYNXNet2` + speaker-token
+  cross-attention (SDPA) in `Unit2Control`.
+- All conditioning branches are **zero-initialized** (identity at init), so the original
+  checkpoints can be loaded and fine-tuned without loss.
+- New files: `encoder/spk_encoder.py` (WavLM-SV wrapper) and `preprocess_spk.py`
+  (resumable speaker vector / token extraction).
+- Inference adds a `-r/--reference` option (multi-reference) to
+  `main_reflow.py`, `batch_infer.py` and `gui_reflow.py`.
+- Configs: `configs/reflow.yaml` (single speaker) and `configs/reflow_multispk.yaml`
+  (large multi-speaker from-scratch training).
+- **Full documentation: [`README_ZEROSHOT.md`](./README_ZEROSHOT.md)** (Chinese).
+
+Quick inference example:
+
+```bash
+python main_reflow.py -m exp/<expdir>/model_XXXX.pt -i input.wav -o out.wav -r ref1.wav,ref2.wav
+```
+
 ## 1. Installing the dependencies
 
 We recommend first installing PyTorch from the [official website](https://pytorch.org/), then run:

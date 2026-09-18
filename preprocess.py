@@ -36,7 +36,16 @@ def parse_args(args=None, namespace=None):
         type=int,
         default=2,
         required=False,
-        help="number of worker processes (default: 2)")
+        help="number of worker processes (default: cpu_count)")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="reprocess every file, ignoring existing outputs (disables resume)")
+    parser.add_argument(
+        "--max-duration",
+        type=float,
+        default=30.0,
+        help="truncate clips longer than this many seconds (0 = no limit) | default: 30")
     return parser.parse_args(args=args, namespace=namespace)
 
 
@@ -64,18 +73,22 @@ def load_extractors(args, sample_rate=None, hop_size=None, device='cuda'):
         print('Unmatch vocoder parameters, mel extraction is ignored!')
     
     # initialize units encoder
-    if args.data.encoder == 'cnhubertsoftfish':
-        cnhubertsoft_gate = args.data.cnhubertsoft_gate
-    else:
-        cnhubertsoft_gate = 10
     units_encoder = Units_Encoder(
                         args.data.encoder, 
                         args.data.encoder_ckpt, 
                         args.data.encoder_sample_rate, 
                         args.data.encoder_hop_size,
-                        cnhubertsoft_gate=cnhubertsoft_gate,
                         device=device)
-    return f0_extractor, volume_extractor, mel_extractor, units_encoder
+
+    # initialize speaker encoder (optional, for zero-shot timbre conditioning)
+    spk_encoder = None
+    if args.model.get('use_spk', False):
+        from encoder.spk_encoder import SpkEncoder
+        spk_encoder = SpkEncoder(
+                        args.model.get('spk_backend', 'wavlm-sv'),
+                        args.model.get('spk_model', None),
+                        device=device)
+    return f0_extractor, volume_extractor, mel_extractor, units_encoder, spk_encoder
     
     
 # Global variables for worker processes (each process has its own copy)
@@ -83,18 +96,19 @@ _worker_f0_extractor = None
 _worker_volume_extractor = None
 _worker_mel_extractor = None
 _worker_units_encoder = None
+_worker_spk_encoder = None
 _worker_device = None
 
 
 def _worker_init(args, device):
     """Initialize extractors for each worker process."""
-    global _worker_f0_extractor, _worker_volume_extractor, _worker_mel_extractor, _worker_units_encoder, _worker_device
+    global _worker_f0_extractor, _worker_volume_extractor, _worker_mel_extractor, _worker_units_encoder, _worker_spk_encoder, _worker_device
     _worker_device = device
-    _worker_f0_extractor, _worker_volume_extractor, _worker_mel_extractor, _worker_units_encoder = load_extractors(
+    _worker_f0_extractor, _worker_volume_extractor, _worker_mel_extractor, _worker_units_encoder, _worker_spk_encoder = load_extractors(
         args, device=device)
 
 
-def _process_file(file, path, sample_rate, hop_size, use_pitch_aug, extensions):
+def _process_file(file, path, sample_rate, hop_size, use_pitch_aug, extensions, use_spk_tokens=False, spk_n_tokens=16, max_duration=0):
     """
     Process a single audio file using either provided extractors or worker-global extractors.
 
@@ -110,13 +124,14 @@ def _process_file(file, path, sample_rate, hop_size, use_pitch_aug, extensions):
     Returns:
         keyshift value if successful, None otherwise
     """
-    global _worker_f0_extractor, _worker_volume_extractor, _worker_mel_extractor, _worker_units_encoder, _worker_device
+    global _worker_f0_extractor, _worker_volume_extractor, _worker_mel_extractor, _worker_units_encoder, _worker_spk_encoder, _worker_device
 
     # Use provided extractors if available, otherwise use global ones
     f0_extractor = _worker_f0_extractor
     volume_extractor = _worker_volume_extractor
     mel_extractor = _worker_mel_extractor
     units_encoder = _worker_units_encoder
+    spk_encoder = _worker_spk_encoder
     device = _worker_device
 
     path_srcdir  = os.path.join(path, 'audio')
@@ -126,6 +141,8 @@ def _process_file(file, path, sample_rate, hop_size, use_pitch_aug, extensions):
     path_augvoldir  = os.path.join(path, 'aug_vol')
     path_meldir  = os.path.join(path, 'mel')
     path_augmeldir  = os.path.join(path, 'aug_mel')
+    path_spkdir = os.path.join(path, 'spk')
+    path_spktokdir = os.path.join(path, 'spk_tokens')
     path_skipdir = os.path.join(path, 'skip')
 
     binfile = file+'.npy'
@@ -136,12 +153,19 @@ def _process_file(file, path, sample_rate, hop_size, use_pitch_aug, extensions):
     path_augvolfile = os.path.join(path_augvoldir, binfile)
     path_melfile = os.path.join(path_meldir, binfile)
     path_augmelfile = os.path.join(path_augmeldir, binfile)
+    path_spkfile = os.path.join(path_spkdir, binfile)
+    path_spktokfile = os.path.join(path_spktokdir, binfile)
     path_skipfile = os.path.join(path_skipdir, file)
     
     # load audio
     audio, _ = librosa.load(path_srcfile, sr=sample_rate)
     if len(audio.shape) > 1:
         audio = librosa.to_mono(audio)
+    # bound memory: truncate overly long clips (all outputs derive from this audio)
+    if max_duration and max_duration > 0:
+        max_len = int(max_duration * sample_rate)
+        if len(audio) > max_len:
+            audio = audio[:max_len]
     audio_t = torch.from_numpy(audio).float().to(device)
     audio_t = audio_t.unsqueeze(0)
     
@@ -179,19 +203,31 @@ def _process_file(file, path, sample_rate, hop_size, use_pitch_aug, extensions):
 
         # save npy     
         os.makedirs(os.path.dirname(path_unitsfile), exist_ok=True)
-        np.save(path_unitsfile, units)
+        np.save(path_unitsfile, units.astype(np.float16))
         os.makedirs(os.path.dirname(path_f0file), exist_ok=True)
         np.save(path_f0file, f0.astype(np.float32))
         os.makedirs(os.path.dirname(path_volumefile), exist_ok=True)
         np.save(path_volumefile, volume)
         if mel_extractor is not None:
             os.makedirs(os.path.dirname(path_melfile), exist_ok=True)
-            np.save(path_melfile, np.ascontiguousarray(mel))
+            np.save(path_melfile, np.ascontiguousarray(mel).astype(np.float16))
             os.makedirs(os.path.dirname(path_augmelfile), exist_ok=True)
-            np.save(path_augmelfile, np.ascontiguousarray(aug_mel))
+            np.save(path_augmelfile, np.ascontiguousarray(aug_mel).astype(np.float16))
             os.makedirs(os.path.dirname(path_augvolfile), exist_ok=True)
             np.save(path_augvolfile, aug_vol)
-            return keyshift
+
+        # speaker embedding (for zero-shot timbre conditioning)
+        if spk_encoder is not None:
+            spk = spk_encoder.encode(audio, sample_rate)
+            os.makedirs(os.path.dirname(path_spkfile), exist_ok=True)
+            np.save(path_spkfile, np.asarray(spk, dtype=np.float32))
+            # speaker tokens (for cross-attention conditioning)
+            if use_spk_tokens:
+                toks = spk_encoder.encode_tokens(audio, sample_rate, n_tokens=spk_n_tokens)
+                os.makedirs(os.path.dirname(path_spktokfile), exist_ok=True)
+                np.save(path_spktokfile, np.asarray(toks, dtype=np.float16))
+
+        return keyshift
     else:
         print('\n[Error] F0 extraction failed: ' + path_srcfile)
         os.makedirs(os.path.dirname(path_skipfile), exist_ok=True)
@@ -200,7 +236,34 @@ def _process_file(file, path, sample_rate, hop_size, use_pitch_aug, extensions):
     return None
 
 
-def preprocess(path, args, sample_rate=None, hop_size=None, device='cuda', use_pitch_aug=False, extensions=['wav'], workers=1):
+def _outputs_done(path, file, use_mel=True, use_spk=False, use_spk_tokens=False, pitch_aug_dict=None):
+    """Return True if every expected output for `file` already exists (for --resume).
+
+    Also requires a pitch-augmentation entry, otherwise training would `KeyError`
+    on `self.pitch_aug_dict[name_ext]` (aug entries are only written by workers).
+    """
+    binfile = file + '.npy'
+    needed = [
+        os.path.join(path, 'units', binfile),
+        os.path.join(path, 'f0', binfile),
+        os.path.join(path, 'volume', binfile),
+    ]
+    if use_mel:
+        needed += [
+            os.path.join(path, 'mel', binfile),
+            os.path.join(path, 'aug_mel', binfile),
+            os.path.join(path, 'aug_vol', binfile),
+        ]
+    if use_spk:
+        needed.append(os.path.join(path, 'spk', binfile))
+    if use_spk_tokens:
+        needed.append(os.path.join(path, 'spk_tokens', binfile))
+    if pitch_aug_dict is not None and file not in pitch_aug_dict:
+        return False
+    return all(os.path.exists(p) for p in needed)
+
+
+def preprocess(path, args, sample_rate=None, hop_size=None, device='cuda', use_pitch_aug=False, extensions=['wav'], workers=1, use_spk_tokens=False, spk_n_tokens=16, use_spk=False, use_mel=True, resume=True, max_duration=0):
     # List files
     path_srcdir = os.path.join(path, 'audio')
     filelist = traverse_dir(
@@ -216,11 +279,27 @@ def preprocess(path, args, sample_rate=None, hop_size=None, device='cuda', use_p
     if hop_size is None:
         hop_size = args.data.block_size
 
+    # keep the existing pitch-augmentation dict so already-processed files stay consistent
+    path_pitchaugdict = os.path.join(path, 'pitch_aug_dict.npy')
+    pitch_aug_dict = {}
+    if resume and os.path.exists(path_pitchaugdict):
+        try:
+            pitch_aug_dict = dict(np.load(path_pitchaugdict, allow_pickle=True).item())
+        except Exception:
+            pitch_aug_dict = {}
+
+    # resume: skip files whose outputs AND pitch-aug entry already exist
+    if resume:
+        pending = [f for f in filelist
+                   if not _outputs_done(path, f, use_mel, use_spk, use_spk_tokens, pitch_aug_dict)]
+        print(f'[resume] {path}: {len(filelist) - len(pending)} already done, {len(pending)} to process')
+    else:
+        pending = list(filelist)
+
     # Prepare arguments for worker initialization
     init_args = (args, device)
 
     # Multiprocessing with ProcessPoolExecutor
-    pitch_aug_dict = {}
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=workers,
         initializer=_worker_init,
@@ -228,12 +307,14 @@ def preprocess(path, args, sample_rate=None, hop_size=None, device='cuda', use_p
     ) as executor:
         # Submit tasks
         future_to_file = {
-            executor.submit(_process_file, file, path, sample_rate, hop_size, use_pitch_aug, extensions): file
-            for file in filelist
+            executor.submit(_process_file, file, path, sample_rate, hop_size, use_pitch_aug, extensions, use_spk_tokens, spk_n_tokens, max_duration): file
+            for file in pending
         }
 
         # Collect results with progress bar
-        for future in tqdm(concurrent.futures.as_completed(future_to_file), total=len(filelist)):
+        flush_every = 2000
+        finished = 0
+        for future in tqdm(concurrent.futures.as_completed(future_to_file), total=len(pending)):
             file = future_to_file[future]
             try:
                 keyshift = future.result()
@@ -241,10 +322,13 @@ def preprocess(path, args, sample_rate=None, hop_size=None, device='cuda', use_p
                     pitch_aug_dict[file] = keyshift
             except Exception as e:
                 print(f'\n[Error] Task for {file} generated an exception: {e}')
+            finished += 1
+            # periodically flush so a crash doesn't lose the pitch-aug entries
+            if len(pitch_aug_dict) > 0 and finished % flush_every == 0:
+                np.save(path_pitchaugdict, pitch_aug_dict)
 
     # Save pitch augmentation dictionary if any
     if len(pitch_aug_dict) > 0:
-        path_pitchaugdict = os.path.join(path, 'pitch_aug_dict.npy')
         np.save(path_pitchaugdict, pitch_aug_dict)
         print(f'Saved pitch augmentation dictionary to {path_pitchaugdict}')
 
@@ -268,9 +352,16 @@ if __name__ == '__main__':
     train_path = args.data.train_path
     valid_path = args.data.valid_path
     use_pitch_aug = args.model.use_pitch_aug
+    use_spk = bool(args.model.get('use_spk', False))
+    use_spk_tokens = bool(args.model.get('use_spk_tokens', False)) if use_spk else False
+    spk_n_tokens = int(args.model.get('spk_n_tokens', 16))
+    resume = not cmd.force
     
     # get number of workers
     workers = cmd.workers
+    if workers is None:
+        import multiprocessing
+        workers = multiprocessing.cpu_count()
     print(f'Using {workers} worker processes')   
 
     # parallel processing
@@ -281,7 +372,12 @@ if __name__ == '__main__':
                device=device,
                use_pitch_aug=use_pitch_aug,
                extensions=extensions,
-               workers=workers)
+               workers=workers,
+               use_spk_tokens=use_spk_tokens,
+               spk_n_tokens=spk_n_tokens,
+               use_spk=use_spk,
+               resume=resume,
+               max_duration=cmd.max_duration)
 
     # preprocess validation set (no pitch augmentation)
     preprocess(valid_path,
@@ -291,4 +387,9 @@ if __name__ == '__main__':
                device=device,
                use_pitch_aug=False,
                extensions=extensions,
-               workers=workers)
+               workers=workers,
+               use_spk_tokens=use_spk_tokens,
+               spk_n_tokens=spk_n_tokens,
+               use_spk=use_spk,
+               resume=resume,
+               max_duration=cmd.max_duration)

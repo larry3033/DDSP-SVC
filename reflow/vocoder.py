@@ -12,9 +12,11 @@ from .lynxnet2 import LYNXNet2
 from ddsp.vocoder import CombSubSuperFast
 
 class DotDict(dict):
-    def __getattr__(*args):         
-        val = dict.get(*args)         
-        return DotDict(val) if type(val) is dict else val   
+    def __getattr__(self, key):
+        if key.startswith('__') and key.endswith('__'):
+            raise AttributeError(key)
+        val = dict.get(self, key)
+        return DotDict(val) if type(val) is dict else val
 
     __setattr__ = dict.__setitem__    
     __delattr__ = dict.__delitem__
@@ -46,7 +48,11 @@ def load_model_vocoder(
                     args.model.n_aux_layers,
                     args.model.n_aux_chans,
                     args.model.n_layers,
-                    args.model.n_chans)
+                    args.model.n_chans,
+                    args.model.get('spk_dim', 0) if args.model.get('use_spk', False) else 0,
+                    args.model.get('use_spk_film', False),
+                    args.model.get('use_spk_reflow', False),
+                    args.model.get('spk_token_dim', 0) if (args.model.get('use_spk', False) and args.model.get('use_spk_tokens', False)) else 0)
                    
     else:
         raise ValueError(f" [x] Unknown Model: {args.model.type}")
@@ -54,7 +60,7 @@ def load_model_vocoder(
     print(' [Loading] ' + model_path)
     ckpt = torch.load(model_path, map_location=torch.device(device))
     model.to(device)
-    model.load_state_dict(ckpt['model'])
+    model.load_state_dict(ckpt['model'], strict=False)
     model.eval()
     return model, vocoder, args
 
@@ -67,8 +73,6 @@ class Vocoder:
         
         if vocoder_type == 'nsf-hifigan':
             self.vocoder = NsfHifiGAN(vocoder_ckpt, device = device)
-        elif vocoder_type == 'nsf-hifigan-log10':
-            self.vocoder = NsfHifiGANLog10(vocoder_ckpt, device = device)
         else:
             raise ValueError(f" [x] Unknown vocoder: {vocoder_type}")
             
@@ -139,17 +143,6 @@ class NsfHifiGAN(torch.nn.Module):
             return audio
 
 
-class NsfHifiGANLog10(NsfHifiGAN):    
-    def forward(self, mel, f0):
-        if self.model is None:
-            print('| Load HifiGAN: ', self.model_path)
-            self.model, self.h = load_model(self.model_path, device=self.device)
-        with torch.no_grad():
-            c = 0.434294 * mel.transpose(1, 2)
-            audio = self.model(c, f0)
-            return audio
-
-
 class Unit2Wav(nn.Module):
     def __init__(
             self,
@@ -165,10 +158,15 @@ class Unit2Wav(nn.Module):
             n_aux_layers=3,
             n_aux_chans=256,
             n_layers=6, 
-            n_chans=512):
+            n_chans=512,
+            spk_dim=0,
+            use_spk_film=False,
+            use_spk_reflow=False,
+            spk_token_dim=0):
         super().__init__()
         self.sampling_rate = sampling_rate
         self.block_size = block_size
+        self.spk_dim = spk_dim
         self.ddsp_model = CombSubSuperFast(
                             sampling_rate, 
                             block_size, 
@@ -179,10 +177,13 @@ class Unit2Wav(nn.Module):
                             n_aux_chans if n_aux_chans is not None else 256,
                             use_norm,
                             use_attention, 
-                            use_pitch_aug)
-        self.reflow_model = RectifiedFlow(LYNXNet2(in_dims=out_dims, dim_cond=out_dims, n_layers=n_layers, n_chans=n_chans), out_dims=out_dims)
+                            use_pitch_aug,
+                            spk_dim,
+                            use_spk_film,
+                            spk_token_dim)
+        self.reflow_model = RectifiedFlow(LYNXNet2(in_dims=out_dims, dim_cond=out_dims, n_layers=n_layers, n_chans=n_chans, spk_dim=spk_dim if use_spk_reflow else 0), out_dims=out_dims)
 
-    def forward(self, units, f0, volume, spk_id=None, spk_mix_dict=None, aug_shift=None, vocoder=None,
+    def forward(self, units, f0, volume, spk_id=None, spk_mix_dict=None, aug_shift=None, spk_vec=None, spk_tokens=None, vocoder=None,
                 gt_spec=None, infer=True, return_wav=False, infer_step=10, method='euler', t_start=0.0, 
                 silence_front=0, use_tqdm=True):
         
@@ -192,7 +193,7 @@ class Unit2Wav(nn.Module):
         return: 
             dict of B x n_frames x feat
         '''
-        ddsp_wav, hidden = self.ddsp_model(units, f0, volume, spk_id=spk_id, spk_mix_dict=spk_mix_dict, aug_shift=aug_shift, infer=infer)
+        ddsp_wav, hidden = self.ddsp_model(units, f0, volume, spk_id=spk_id, spk_mix_dict=spk_mix_dict, aug_shift=aug_shift, spk_vec=spk_vec, spk_tokens=spk_tokens, infer=infer)
         start_frame = int(silence_front * self.sampling_rate / self.block_size)
         if vocoder is not None:
             ddsp_mel = vocoder.extract(ddsp_wav[:, start_frame * self.block_size:])
@@ -202,7 +203,7 @@ class Unit2Wav(nn.Module):
         if not infer:
             ddsp_loss = F.mse_loss(ddsp_mel, gt_spec)
             if t_start < 1.0:
-                reflow_loss = self.reflow_model(ddsp_mel, gt_spec=gt_spec, t_start=t_start, infer=False)
+                reflow_loss = self.reflow_model(ddsp_mel, gt_spec=gt_spec, t_start=t_start, infer=False, spk_cond=spk_vec)
             else:
                 reflow_loss = torch.tensor(0)
             return ddsp_loss, reflow_loss
@@ -210,7 +211,7 @@ class Unit2Wav(nn.Module):
             if gt_spec is not None and ddsp_mel is None:
                 ddsp_mel = gt_spec
             if t_start < 1.0:
-                mel = self.reflow_model(ddsp_mel, gt_spec=ddsp_mel, infer=True, infer_step=infer_step, method=method, t_start=t_start, use_tqdm=use_tqdm)
+                mel = self.reflow_model(ddsp_mel, gt_spec=ddsp_mel, infer=True, infer_step=infer_step, method=method, t_start=t_start, use_tqdm=use_tqdm, spk_cond=spk_vec)
             else:
                 mel = ddsp_mel
             if return_wav:

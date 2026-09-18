@@ -40,6 +40,8 @@ class SvcDDSP:
         self.encoder_type = None
         self.encoder_ckpt = None
         self.formant_shift_key = None
+        self.spk_encoder = None
+        self.spk_cache = {}
 
     def update_model(self, reflow_model_path):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -49,20 +51,47 @@ class SvcDDSP:
             
         # load units encoder
         if self.units_encoder is None or self.args.data.encoder != self.encoder_type or self.args.data.encoder_ckpt != self.encoder_ckpt:
-            if self.args.data.encoder == 'cnhubertsoftfish':
-                cnhubertsoft_gate = self.args.data.cnhubertsoft_gate
-            else:
-                cnhubertsoft_gate = 10
             self.units_encoder = Units_Encoder(
                 self.args.data.encoder,
                 self.args.data.encoder_ckpt,
                 self.args.data.encoder_sample_rate,
                 self.args.data.encoder_hop_size,
-                cnhubertsoft_gate=cnhubertsoft_gate,
                 device=self.device)
             self.encoder_type = self.args.data.encoder
             self.encoder_ckpt = self.args.data.encoder_ckpt
    
+    def _get_spk_vec(self, reference_audio):
+        if reference_audio is None or reference_audio.strip() == '':
+            return None
+        if self.spk_encoder is None:
+            from encoder.spk_encoder import SpkEncoder
+            self.spk_encoder = SpkEncoder(
+                self.args.model.get('spk_backend', 'wavlm-sv'),
+                self.args.model.get('spk_model', None),
+                device=self.device)
+        if reference_audio not in self.spk_cache:
+            refs = [r.strip() for r in reference_audio.split(',') if r.strip() != '']
+            z = self.spk_encoder.encode_files(refs)
+            self.spk_cache[reference_audio] = torch.from_numpy(z.astype(np.float32)).unsqueeze(0).to(self.device)
+        return self.spk_cache[reference_audio]
+
+    def _get_spk_tokens(self, reference_audio):
+        if reference_audio is None or reference_audio.strip() == '':
+            return None
+        if self.spk_encoder is None:
+            from encoder.spk_encoder import SpkEncoder
+            self.spk_encoder = SpkEncoder(
+                self.args.model.get('spk_backend', 'wavlm-sv'),
+                self.args.model.get('spk_model', None),
+                device=self.device)
+        key = 'TOK::' + reference_audio
+        if key not in self.spk_cache:
+            refs = [r.strip() for r in reference_audio.split(',') if r.strip() != '']
+            n_tokens = int(self.args.model.get('spk_n_tokens', 16))
+            toks = self.spk_encoder.encode_tokens_files(refs, n_tokens=n_tokens)
+            self.spk_cache[key] = torch.from_numpy(toks.astype(np.float32)).unsqueeze(0).to(self.device)
+        return self.spk_cache[key]
+
     def infer(self,
               audio,
               sample_rate,
@@ -72,14 +101,15 @@ class SvcDDSP:
               formant_shift_key=0,
               use_spk_mix=False,
               spk_mix_dict=None,
-              pitch_extractor_type='crepe',
+              pitch_extractor_type='rmvpe',
               f0_min=50,
               f0_max=1100,
               safe_prefix_pad_length=0,
               sampling_method='euler',
               infer_step=None,
               t_start=0.7,
-              audio_alignment=False
+              audio_alignment=False,
+              reference_audio=''
               ):
         print("Infering...")
         # load input
@@ -126,6 +156,14 @@ class SvcDDSP:
         if use_spk_mix:
             dictionary = spk_mix_dict
 
+        # zero-shot speaker embedding / tokens
+        spk_vec = None
+        spk_tokens = None
+        if self.args.model.get('use_spk', False):
+            spk_vec = self._get_spk_vec(reference_audio)
+            if self.args.model.get('use_spk_tokens', False):
+                spk_tokens = self._get_spk_tokens(reference_audio)
+
         # forward and return the output
         with torch.no_grad():
             output = self.reflow_model(
@@ -135,6 +173,8 @@ class SvcDDSP:
                                     spk_id = spk_id, 
                                     spk_mix_dict = dictionary,
                                     aug_shift = formant_shift_key,
+                                    spk_vec = spk_vec,
+                                    spk_tokens = spk_tokens,
                                     vocoder=self.vocoder,
                                     infer=True,
                                     return_wav=True,
@@ -162,13 +202,14 @@ class Config:
         self.threshold = -45
         self.crossfade_time = 0.04
         self.extra_time = 2
-        self.select_pitch_extractor = 'harvest'  # F0预测器["parselmouth", "dio", "harvest", "crepe", "rmvpe", "fcpe"]
+        self.select_pitch_extractor = 'rmvpe'  # F0预测器["rmvpe"]
         self.use_spk_mix = False
         self.sounddevices = ['', '']
         self.reflow_model = ''
         self.t_start = 0.7
         self.infer_step = 30
         self.sampling_method = 'euler'
+        self.reference_audio = ''
 
     def save(self, path):
         with open(path + '\\config.pkl', 'wb') as f:
@@ -199,7 +240,7 @@ class GUI:
         self.fade_out_window: torch.Tensor = None  
         self.input_wav: np.ndarray = None
         self.sola_buffer: torch.Tensor = None
-        self.f0_mode_list = ["parselmouth", "dio", "harvest", "crepe" ,"rmvpe", "fcpe"]  # F0预测器
+        self.f0_mode_list = ["rmvpe"]  # F0预测器
         self.sampling_method_list = ["euler", "rk4"] # 采样方法
         self.f_safe_prefix_pad_length: float = 0.0
         self.resample_kernel = {}
@@ -257,6 +298,8 @@ class GUI:
                  sg.Slider(range=(-2, 2), orientation='h', key='formant_shift_key', resolution=0.05, default_value=0,
                            enable_events=True)],
                 [sg.Text(i18n("采样率")), sg.Input(key='samplerate', default_text='44100', size=8)],
+                [sg.Text(i18n('参考音频(零样本音色)')), sg.Input(key='reference_audio', default_text='', size=30),
+                 sg.FileBrowse(i18n('选择参考音频'), key='choose_reference')],
                 [sg.Checkbox(text=i18n('启用捏音色功能'), default=False, key='spk_mix', enable_events=True),
                  sg.Button(i18n("设置混合音色"), key='set_spk_mix')]
             ], title=i18n('普通设置')),
@@ -288,6 +331,7 @@ class GUI:
         self.window['samplerate'].bind('<Return>', '')
         self.window['infer_step'].bind('<Return>', '')
         self.window['t_start'].bind('<Return>', '')
+        self.window['reference_audio'].bind('<Return>', '')
         self.event_handler()
 
     def event_handler(self):
@@ -357,6 +401,7 @@ class GUI:
         self.config.reflow_model = values['reflow_model']
         self.config.t_start = values['t_start']
         self.config.infer_step = int(values['infer_step'])
+        self.config.reference_audio = values['reference_audio']
         self.block_frame = int(self.config.block_time * self.config.samplerate)
         self.crossfade_frame = int(self.config.crossfade_time * self.config.samplerate)
         self.sola_search_frame = int(0.01 * self.config.samplerate)
@@ -384,6 +429,7 @@ class GUI:
         self.window['reflow_model'].update(self.config.reflow_model)
         self.window['t_start'].update(self.config.t_start)
         self.window['infer_step'].update(self.config.infer_step)
+        self.window['reference_audio'].update(self.config.reference_audio)
 
     def start_vc(self):
         '''开始音频转换'''
@@ -441,6 +487,7 @@ class GUI:
             sampling_method=self.config.sampling_method,
             infer_step=self.config.infer_step,
             t_start=float(self.config.t_start),
+            reference_audio=self.config.reference_audio,
         )
 
         # debug sola

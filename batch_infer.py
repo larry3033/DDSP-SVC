@@ -6,8 +6,6 @@ import librosa
 import argparse
 import numpy as np
 import soundfile as sf
-import pyworld as pw
-import parselmouth
 import hashlib
 from ast import literal_eval
 from slicer import Slicer
@@ -129,6 +127,14 @@ def parse_args(args=None, namespace=None):
         help="mix-speaker dictionary (for multi-speaker model) | default: None",
     )
     parser.add_argument(
+        "-r",
+        "--reference",
+        type=str,
+        required=False,
+        default='',
+        help="path(s) to reference audio for zero-shot timbre, comma separated | default: empty (zero embedding)",
+    )
+    parser.add_argument(
         "-k",
         "--key",
         type=str,
@@ -158,7 +164,7 @@ def parse_args(args=None, namespace=None):
         type=str,
         required=False,
         default='rmvpe',
-        help="pitch extrator type: parselmouth, dio, harvest, crepe, fcpe, rmvpe (default)",
+        help="pitch extrator type: rmvpe (default)",
     )
     parser.add_argument(
         "-fmin",
@@ -220,7 +226,7 @@ def parse_args(args=None, namespace=None):
     return parser.parse_args(args=args, namespace=namespace)
 
 
-def infer(input_path, output_path, cmd, device, model, vocoder, args, units_encoder):
+def infer(input_path, output_path, cmd, device, model, vocoder, args, units_encoder, spk_vec=None, spk_tokens=None):
     # load input
     audio, sample_rate = librosa.load(input_path, sr=None)
     if len(audio.shape) > 1:
@@ -334,6 +340,8 @@ def infer(input_path, output_path, cmd, device, model, vocoder, args, units_enco
             spk_id=spk_id,
             spk_mix_dict=spk_mix_dict,
             aug_shift=formant_shift_key,
+            spk_vec=spk_vec,
+            spk_tokens=spk_tokens,
             vocoder=vocoder,
             infer=True,
             infer_step=infer_step, 
@@ -361,17 +369,41 @@ if __name__ == '__main__':
     model, vocoder, args = load_model_vocoder(cmd.model_ckpt, device=device)
 
     # load units encoder
-    if args.data.encoder == 'cnhubertsoftfish':
-        cnhubertsoft_gate = args.data.cnhubertsoft_gate
-    else:
-        cnhubertsoft_gate = 10
     units_encoder = Units_Encoder(
         args.data.encoder,
         args.data.encoder_ckpt,
         args.data.encoder_sample_rate,
         args.data.encoder_hop_size,
-        cnhubertsoft_gate=cnhubertsoft_gate,
         device=device)
+
+    # zero-shot speaker embedding / tokens from reference audio
+    spk_vec = None
+    spk_tokens = None
+    spk_dim = int(args.model.get('spk_dim', 0)) if args.model.get('use_spk', False) else 0
+    if spk_dim > 0:
+        from encoder.spk_encoder import SpkEncoder
+        spk_encoder = SpkEncoder(
+            args.model.get('spk_backend', 'wavlm-sv'),
+            args.model.get('spk_model', None),
+            device=device)
+        assert spk_encoder.dim == spk_dim, \
+            f' [x] config spk_dim={spk_dim} but encoder outputs {spk_encoder.dim}'
+        refs = [r.strip() for r in cmd.reference.split(',') if r.strip() != '']
+        if len(refs) > 0:
+            print('Reference speaker(s): ' + ', '.join(refs))
+            z = spk_encoder.encode_files(refs)
+        else:
+            print(' [warn] no reference audio given (use -r), using a zero speaker embedding')
+            z = np.zeros(spk_encoder.dim, dtype=np.float32)
+        spk_vec = torch.from_numpy(z.astype(np.float32)).unsqueeze(0).to(device)
+        if args.model.get('use_spk_tokens', False):
+            n_tokens = int(args.model.get('spk_n_tokens', 16))
+            if len(refs) > 0:
+                toks = spk_encoder.encode_tokens_files(refs, n_tokens=n_tokens)
+            else:
+                toks = np.zeros((n_tokens, spk_encoder.hidden_dim), dtype=np.float32)
+            spk_tokens = torch.from_numpy(toks.astype(np.float32)).unsqueeze(0).to(device)
+
     wav_paths = traverse_dir(
         cmd.input,
         extensions=extensions,
@@ -384,4 +416,4 @@ if __name__ == '__main__':
         output_path = (pathlib.Path(cmd.output) / rel_path).with_suffix('.wav')
         print('_______________________________')
         print('Input: ' + str(input_path))
-        infer(input_path, output_path, cmd, device, model, vocoder, args, units_encoder)
+        infer(input_path, output_path, cmd, device, model, vocoder, args, units_encoder, spk_vec, spk_tokens)

@@ -63,6 +63,8 @@ def traverse_dir(
 
 
 def get_data_loaders(args, whole_audio=False):
+    use_spk = bool(args.model.get('use_spk', False))
+    use_spk_tokens = bool(args.model.get('use_spk_tokens', False)) if use_spk else False
     data_train = AudioDataset(
         args.data.train_path,
         waveform_sec=args.data.duration,
@@ -74,7 +76,12 @@ def get_data_loaders(args, whole_audio=False):
         n_spk=args.model.n_spk,
         device=args.train.cache_device,
         fp16=args.train.cache_fp16,
-        use_aug=True)
+        use_aug=True,
+        use_spk=use_spk,
+        use_spk_tokens=use_spk_tokens,
+        spk_cross_prob=args.train.get('spk_cross_prob', 0.5),
+        spk_noise=args.train.get('spk_noise', 0.02),
+        spk_drop_prob=args.train.get('spk_drop_prob', 0.1))
     loader_train = torch.utils.data.DataLoader(
         data_train ,
         batch_size=args.train.batch_size if not whole_audio else 1,
@@ -91,7 +98,9 @@ def get_data_loaders(args, whole_audio=False):
         load_all_data=args.train.cache_all_data,
         whole_audio=True,
         extensions=args.data.extensions,
-        n_spk=args.model.n_spk)
+        n_spk=args.model.n_spk,
+        use_spk=use_spk,
+        use_spk_tokens=use_spk_tokens)
     loader_valid = torch.utils.data.DataLoader(
         data_valid,
         batch_size=1,
@@ -116,6 +125,11 @@ class AudioDataset(Dataset):
         device='cpu',
         fp16=False,
         use_aug=False,
+        use_spk=False,
+        use_spk_tokens=False,
+        spk_cross_prob=0.5,
+        spk_noise=0.02,
+        spk_drop_prob=0.1,
     ):
         super().__init__()
         
@@ -138,6 +152,53 @@ class AudioDataset(Dataset):
             print('Load all the data from :', path_root)
         else:
             print('Load the f0, volume data from :', path_root)
+
+        # speaker embeddings (zero-shot timbre conditioning)
+        self.use_spk = use_spk
+        self.use_spk_tokens = use_spk_tokens
+        self.spk_cross_prob = spk_cross_prob
+        self.spk_noise = spk_noise
+        self.spk_drop_prob = spk_drop_prob
+        self.spk_buffer = {}
+        self.spk_token_buffer = {}
+        self.spk_to_indices = {}
+        self.spk_dim = 0
+        self.spk_token_dim = 0
+        self.spk_token_dir = os.path.join(path_root, 'spk_tokens')
+        if self.use_spk or self.use_spk_tokens:
+            spk_dir = os.path.join(path_root, 'spk')
+            missing = 0
+            for idx, name_ext in enumerate(self.paths):
+                speaker = os.path.dirname(name_ext)
+                self.spk_to_indices.setdefault(speaker, []).append(idx)
+                if self.use_spk:
+                    path_spk = os.path.join(spk_dir, name_ext) + '.npy'
+                    if os.path.exists(path_spk):
+                        self.spk_buffer[name_ext] = np.load(path_spk).astype(np.float32)
+                    else:
+                        missing += 1
+                if self.use_spk_tokens:
+                    path_tok = os.path.join(self.spk_token_dir, name_ext) + '.npy'
+                    if not os.path.exists(path_tok):
+                        missing += 1
+                    elif load_all_data:
+                        self.spk_token_buffer[name_ext] = np.load(path_tok).astype(np.float32)
+            if missing > 0:
+                raise FileNotFoundError(
+                    f' [x] {missing} speaker embedding/token files missing under {path_root}. '
+                    f'Run preprocess.py or preprocess_spk.py first.')
+            if self.use_spk:
+                self.spk_dim = int(len(next(iter(self.spk_buffer.values()))))
+            if self.use_spk_tokens:
+                if len(self.spk_token_buffer) > 0:
+                    _t = next(iter(self.spk_token_buffer.values()))
+                else:
+                    _first = self.paths[0]
+                    _t = np.load(os.path.join(self.spk_token_dir, _first) + '.npy')
+                self.spk_token_dim = int(_t.shape[-1])
+                print(f'Load speaker tokens (n_tokens={_t.shape[0]}, dim={self.spk_token_dim}) from : {self.spk_token_dir}')
+            print(f'Load {len(self.spk_buffer)} speaker embeddings (dim={self.spk_dim}, '
+                  f'{len(self.spk_to_indices)} speakers) from : {spk_dir}')
         
         def _load_single_file(name_ext):
             name = os.path.splitext(name_ext)[0]
@@ -232,6 +293,13 @@ class AudioDataset(Dataset):
         # get item
         return self.get_data(name_ext, data_buffer)
 
+    def _load_spk_tokens(self, name_ext):
+        buf = self.spk_token_buffer.get(name_ext)
+        if buf is not None:
+            return torch.from_numpy(np.array(buf, dtype=np.float32, copy=True))
+        path_tok = os.path.join(self.spk_token_dir, name_ext) + '.npy'
+        return torch.from_numpy(np.load(path_tok).astype(np.float32))
+
     def get_data(self, name_ext, data_buffer):
         name = os.path.splitext(name_ext)[0]
         start_frame = 0 if self.whole_audio else random.randint(0, data_buffer['frame_len'] - self.crop_len)
@@ -276,8 +344,41 @@ class AudioDataset(Dataset):
         
         # load shift
         aug_shift = torch.from_numpy(np.array([[aug_shift]])).float()
-        
-        return dict(mel=mel, f0=f0_frames, volume=volume_frames, units=units, spk_id=spk_id, aug_shift=aug_shift, name=name, name_ext=name_ext)
+
+        # speaker embedding / tokens (cross-utterance pairing + noise/dropout to avoid content leakage)
+        spk_vec = None
+        spk_tokens = None
+        if self.use_spk or self.use_spk_tokens:
+            ref_name = name_ext
+            if self.use_aug and random.random() < self.spk_cross_prob:
+                candidates = self.spk_to_indices.get(os.path.dirname(name_ext), [])
+                if len(candidates) > 1:
+                    while ref_name == name_ext:
+                        ref_name = self.paths[random.choice(candidates)]
+            drop = self.use_aug and self.spk_drop_prob > 0 and random.random() < self.spk_drop_prob
+            if self.use_spk:
+                z = np.array(self.spk_buffer[ref_name], dtype=np.float32, copy=True)
+                if self.use_aug and self.spk_noise > 0:
+                    z = z + np.random.randn(*z.shape).astype(np.float32) * self.spk_noise
+                if drop:
+                    z = np.zeros_like(z)
+                z = z / (np.linalg.norm(z) + 1e-6)
+                spk_vec = torch.from_numpy(z.astype(np.float32))
+            if self.use_spk_tokens:
+                tok = self._load_spk_tokens(ref_name)
+                if self.use_aug and self.spk_noise > 0:
+                    tok = tok + torch.randn_like(tok) * self.spk_noise
+                if drop:
+                    tok = torch.zeros_like(tok)
+                spk_tokens = tok
+
+        data = dict(mel=mel, f0=f0_frames, volume=volume_frames, units=units,
+                    spk_id=spk_id, aug_shift=aug_shift, name=name, name_ext=name_ext)
+        if spk_vec is not None:
+            data['spk_vec'] = spk_vec
+        if spk_tokens is not None:
+            data['spk_tokens'] = spk_tokens
+        return data
 
     def __len__(self):
         return len(self.paths)

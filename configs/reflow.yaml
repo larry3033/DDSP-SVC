@@ -1,16 +1,15 @@
 data:
-  f0_extractor: 'rmvpe' # 'parselmouth', 'dio', 'harvest', 'crepe' or 'rmvpe'
+  f0_extractor: 'rmvpe' # only 'rmvpe' is supported
   f0_min: 65 # about C2
   f0_max: 800 # about G5
   sampling_rate: 44100
   volume_smooth_size: 1024
   block_size: 512 # Equal to hop_length
   duration: 2 # Audio duration during training, must be less than the duration of the shortest audio clip
-  encoder: 'contentvec768l12tta2x' # 'hubertsoft', 'contentvec768l12', 'contentvec768l12tta2x' or 'cnhubertsoftfish'
-  cnhubertsoft_gate: 10
+  encoder: 'contentvec768l12tta2x' # only 'contentvec768l12tta2x' is supported
   encoder_sample_rate: 16000
   encoder_hop_size: 160 # 160 for 'contentvec768l12tta2x', 320 for any others
-  encoder_out_channels: 768 # 256 if using 'hubertsoft'
+  encoder_out_channels: 768 # 768 for 'contentvec768l12tta2x'
   encoder_ckpt: pretrain/contentvec/pytorch_model.bin
   train_path: data/train # Create a folder named "audio" under this path and put the audio clip in it
   valid_path: data/val # Create a folder named "audio" under this path and put the audio clip in it
@@ -28,6 +27,16 @@ model:
   use_attention: false
   use_pitch_aug: true 
   n_spk: 1 # max number of different speakers
+  # ---- zero-shot speaker conditioning (global speaker embedding) ----
+  use_spk: true # enable continuous speaker conditioning
+  spk_dim: 512 # embedding dim of the speaker encoder (WavLM-SV = 512)
+  use_spk_film: true # FiLM injection in the DDSP control network (per layer)
+  use_spk_reflow: true # FiLM injection in the reflow conditioner (LYNXNet2)
+  use_spk_tokens: true # cross-attention over reference speaker tokens
+  spk_token_dim: 768 # token feature dim of the speaker encoder (WavLM hidden = 768)
+  spk_n_tokens: 16 # number of tokens pooled from the reference audio
+  spk_backend: 'wavlm-sv'
+  spk_model: 'microsoft/wavlm-base-plus-sv'
 device: cuda # training device
 vocoder:
   type: 'nsf-hifigan'
@@ -41,7 +50,7 @@ env:
 train:
   num_workers: 2 # If your cpu and gpu are both very strong, set to 0 may be faster!
   amp_dtype: fp16 # fp32, fp16 or bf16 (fp16 or bf16 may be faster if it is supported by your gpu)
-  batch_size: 48
+  batch_size: 32
   cache_all_data: true # Save Internal-Memory or Graphics-Memory if it is false, but may be slow
   cache_device: 'cpu' # Set to 'cuda' to cache the data into the Graphics-Memory, fastest speed for strong gpu
   cache_fp16: true
@@ -55,3 +64,7 @@ train:
   weight_decay: 0.1
   lambda_ddsp: 1
   save_opt: false  
+  # zero-shot speaker conditioning augmentation (train only)
+  spk_cross_prob: 0.5 # prob. of using another utterance of the same speaker as the reference
+  spk_noise: 0.02 # gaussian noise added to the speaker embedding
+  spk_drop_prob: 0.1 # prob. of dropping the speaker embedding (unconditional)
